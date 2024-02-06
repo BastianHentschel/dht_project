@@ -1,6 +1,4 @@
 pub mod config;
-use crate::MessageType::*;
-use config::get_config;
 use config::HashType;
 use std::{
     collections::VecDeque,
@@ -8,6 +6,8 @@ use std::{
     ops::{Range, RangeInclusive},
     sync::Arc,
 };
+use crate::MessageType::{Lookup, Reply};
+
 pub struct HashTable {
     table: Box<[Option<Arc<[u8]>>]>,
     offset: HashType,
@@ -19,6 +19,7 @@ pub struct RedirectCache {
 }
 
 impl RedirectCache {
+    #[must_use]
     pub fn new(max_size: usize) -> Self {
         Self {
             queue: VecDeque::new(),
@@ -34,6 +35,7 @@ impl RedirectCache {
             .push_back((hash_range.start + 1..=hash_range.end, addr));
     }
 
+    #[must_use]
     pub fn get(&self, hash_value: HashType) -> Option<SocketAddrV4> {
         self.queue.iter().find_map(|(range, addr)| {
             (if range.start() < range.end() {
@@ -47,6 +49,7 @@ impl RedirectCache {
 }
 
 impl HashTable {
+    #[must_use]
     pub fn new(id: HashType, pred_id: HashType) -> Self {
         let size = id.wrapping_sub(pred_id);
         Self {
@@ -55,6 +58,7 @@ impl HashTable {
         }
     }
 
+    #[must_use]
     pub fn get(&self, index: HashType) -> Option<Arc<[u8]>> {
         self.table[index.wrapping_sub(self.offset) as usize]
             .as_ref()
@@ -96,6 +100,7 @@ pub struct UDPMessage {
 }
 
 impl UDPMessage {
+    #[must_use]
     pub fn as_bytes(&self) -> [u8; 11] {
         let mut buf = [0u8; 11];
         buf[0] = self.message_type as u8;
@@ -107,12 +112,14 @@ impl UDPMessage {
         buf
     }
 
+    #[must_use]
     pub fn as_location(&self) -> SocketAddrV4 {
         SocketAddrV4::new(self.node_ip, self.node_port)
     }
 
+    #[must_use]
     pub fn reply_from_this_node() -> Self {
-        let config = get_config();
+        let config = config::get();
         Self {
             message_type: Reply,
             hash: config.pred_id,
@@ -122,8 +129,9 @@ impl UDPMessage {
         }
     }
 
+    #[must_use]
     pub fn reply_from_succ_node() -> Self {
-        let config = get_config();
+        let config = config::get();
         Self {
             message_type: Reply,
             hash: config.bind_id,

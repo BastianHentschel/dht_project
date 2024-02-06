@@ -2,12 +2,15 @@
 #![feature(read_buf)]
 #![feature(core_io_borrowed_buf)]
 #![feature(never_type)]
-use crate::MessageType::*;
 use anyhow::Context;
 use byteorder::{BigEndian, ByteOrder};
-use config::Location::*;
-use config::*;
-use dht_project::*;
+use config::HashType;
+use config::Location::{Here, Successor, Unknown};
+use dht_project::{
+    config, HashTable,
+    MessageType::{Lookup, Reply},
+    RedirectCache, UDPMessage,
+};
 use sha2::Digest;
 use sha2::Sha256;
 use std::io::{BorrowedBuf, BufRead, BufReader, BufWriter, Read, Write};
@@ -16,8 +19,8 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread::{self, JoinHandle};
 fn main() -> anyhow::Result<!> {
-    setup_global_config();
-    let config = get_config();
+    config::set();
+    let config = config::get();
     let cache = RedirectCache::new(10);
     let cache = Arc::new(RwLock::new(cache));
     let udp_socket = UdpSocket::bind((config.bind_ip, config.bind_port))?;
@@ -71,16 +74,15 @@ fn spawn_udp_listener(
     cache: Arc<RwLock<RedirectCache>>,
 ) {
     let _: JoinHandle<anyhow::Result<!>> = thread::spawn(move || {
-        let config = get_config();
+        let config = config::get();
         let listener = TcpListener::bind((bind_address, bind_port))?;
-        #[allow(clippy::unwrap_used)]
         let table = HashTable::new(id, config.pred_id);
         let table = Arc::new(RwLock::new(table));
         for stream in listener.incoming().map(Result::unwrap) {
             let t_table = table.clone();
             let t_t_cache = cache.clone();
             let socket = udp_socket.try_clone()?;
-            thread::spawn(move || handle_connection(stream, t_table, socket, t_t_cache));
+            thread::spawn(move || handle_connection(&stream, t_table, &socket, t_t_cache));
         }
 
         unreachable!()
@@ -108,15 +110,14 @@ fn read_header<R: BufRead>(mut reader: R) -> anyhow::Result<HttpHeader> {
     let content_length = request
         .iter()
         .find(|line| line.starts_with("Content-Length:"))
-        .map(|line| {
+        .map_or(Ok(0), |line| {
             line.split(':')
                 .nth(1)
                 .context("Invalid Content-Length Format")?
                 .trim()
                 .parse()
                 .context("Invalid Content-Length Format")
-        })
-        .unwrap_or(Ok(0));
+        });
 
     Ok(HttpHeader {
         method: method.to_string(),
@@ -124,20 +125,23 @@ fn read_header<R: BufRead>(mut reader: R) -> anyhow::Result<HttpHeader> {
         content_length: content_length?,
     })
 }
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::similar_names)]
 fn handle_connection(
-    stream: TcpStream,
+    stream: &TcpStream,
     hash_table: Arc<RwLock<HashTable>>,
-    socket: UdpSocket,
+    socket: &UdpSocket,
     t_cache: Arc<RwLock<RedirectCache>>,
 ) -> anyhow::Result<()> {
     let local_addr = stream.local_addr()?;
-    let mut reader = BufReader::new(&stream);
-    let mut writer = BufWriter::new(&stream);
+    let mut reader = BufReader::new(stream);
+    let mut writer = BufWriter::new(stream);
     loop {
         let header = read_header(&mut reader)?;
 
         let hash_value = BigEndian::read_u16(&Sha256::digest(&header.path));
-        let config = get_config();
+        let config = config::get();
         match config.where_is_hash(hash_value) {
             // This Node is responsible
             Here => match header.method.as_str() {

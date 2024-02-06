@@ -25,42 +25,59 @@ pub enum Location {
     Unknown,
 }
 impl Config {
+    #[must_use]
     pub fn get_succ(&self) -> SocketAddrV4 {
         SocketAddrV4::new(self.succ_ip, self.succ_port)
     }
+    #[must_use]
     pub fn get_bind(&self) -> SocketAddrV4 {
         SocketAddrV4::new(self.bind_ip, self.bind_port)
     }
 
+    #[must_use]
     pub fn get_pred(&self) -> SocketAddrV4 {
         SocketAddrV4::new(self.bind_ip, self.bind_port)
     }
+    #[must_use]
     pub fn is_in_self(&self, hash_value: HashType) -> bool {
-        self.pred_id < hash_value && hash_value <= self.bind_id
-            || self.bind_id < self.pred_id && hash_value <= self.bind_id
-            || self.bind_id < self.pred_id && self.pred_id < hash_value
+        self.pred_id < hash_value && (hash_value <= self.bind_id || self.bind_id < self.pred_id)
+            || (hash_value <= self.bind_id && self.bind_id < self.pred_id)
     }
 
+    #[must_use]
     pub fn is_in_successor(&self, hash_value: HashType) -> bool {
-        self.bind_id < hash_value && hash_value <= self.succ_id
-            || self.succ_id < self.bind_id && hash_value <= self.succ_id
-            || self.succ_id < self.bind_id && self.bind_id < hash_value
+        self.bind_id < hash_value && (hash_value <= self.succ_id || self.succ_id < self.bind_id)
+            || (hash_value <= self.succ_id && self.succ_id < self.bind_id)
     }
+    #[must_use]
     pub fn where_is_hash(&self, hash_value: HashType) -> Location {
-        use Location::*;
         if self.is_in_self(hash_value) {
-            Here
+            Location::Here
         } else if self.is_in_successor(hash_value) {
-            Successor
+            Location::Successor
         } else {
-            Unknown
+            Location::Unknown
         }
     }
 }
-pub fn get_config() -> &'static Config {
+
+/// gets the global config
+///
+/// # Panics
+///
+/// Will panic if the config is not set via [`set`].
+pub fn get() -> &'static Config {
     CONFIG.get().unwrap()
 }
-pub fn setup_global_config() {
+
+/// sets the global config.
+///
+/// # Panics
+///
+/// Will panic if called more than once.
+
+#[allow(clippy::similar_names)]
+pub fn set() {
     let pred_id = env::var("PRED_ID")
         .unwrap_or("0".to_string())
         .parse::<HashType>()
@@ -104,17 +121,15 @@ pub fn setup_global_config() {
         .expect("Invalid ID");
     CONFIG
         .set(Config {
-            bind_id,
-            bind_ip,
-            bind_port,
-
-            succ_id,
-            succ_ip,
-            succ_port,
-
             pred_id,
             pred_ip,
             pred_port,
+            succ_id,
+            succ_ip,
+            succ_port,
+            bind_id,
+            bind_ip,
+            bind_port,
         })
         .expect("Config can only be set once");
 }
