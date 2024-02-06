@@ -2,23 +2,21 @@
 #![feature(read_buf)]
 #![feature(core_io_borrowed_buf)]
 #![feature(never_type)]
-
+mod config;
 use std::io::{BorrowedBuf, BufRead, BufReader, BufWriter, Read, Write};
 
-use crate::Location::{Here, Successor, Unknown};
 use crate::MessageType::{Lookup, Reply};
 use anyhow::Context;
 use byteorder::{BigEndian, ByteOrder};
+use config::Location::*;
+use config::{get_config, HashType};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::ops::{Range, RangeInclusive};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
+use std::thread;
 use std::thread::JoinHandle;
-use std::{env, thread};
-
-type HashType = u16;
-
 struct HashTable {
     table: Box<[Option<Arc<[u8]>>]>,
     offset: HashType,
@@ -81,16 +79,6 @@ impl HashTable {
     }
 }
 
-static PRED_ID: OnceLock<HashType> = OnceLock::new();
-static PRED_IP: OnceLock<Ipv4Addr> = OnceLock::new();
-static PRED_PORT: OnceLock<u16> = OnceLock::new();
-static SUCC_ID: OnceLock<HashType> = OnceLock::new();
-static SUCC_IP: OnceLock<Ipv4Addr> = OnceLock::new();
-static SUCC_PORT: OnceLock<u16> = OnceLock::new();
-static ID: OnceLock<HashType> = OnceLock::new();
-static BIND_ADDRESS: OnceLock<Ipv4Addr> = OnceLock::new();
-static BIND_PORT: OnceLock<u16> = OnceLock::new();
-
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 enum MessageType {
     Lookup = 0,
@@ -133,22 +121,24 @@ impl UDPMessage {
     }
 
     fn reply_from_this_node() -> Self {
+        let config = get_config();
         Self {
             message_type: Reply,
-            hash: *PRED_ID.get().unwrap(),
-            node_id: *ID.get().unwrap(),
-            node_ip: *BIND_ADDRESS.get().unwrap(),
-            node_port: *BIND_PORT.get().unwrap(),
+            hash: config.pred_id,
+            node_id: config.bind_id,
+            node_ip: config.bind_ip,
+            node_port: config.bind_port,
         }
     }
 
     fn reply_from_succ_node() -> Self {
+        let config = get_config();
         Self {
             message_type: Reply,
-            hash: *ID.get().unwrap(),
-            node_id: *SUCC_ID.get().unwrap(),
-            node_ip: *SUCC_IP.get().unwrap(),
-            node_port: *SUCC_PORT.get().unwrap(),
+            hash: config.bind_id,
+            node_id: config.succ_id,
+            node_ip: config.succ_ip,
+            node_port: config.succ_port,
         }
     }
 }
@@ -166,36 +156,17 @@ impl From<[u8; 11]> for UDPMessage {
 }
 
 fn main() -> anyhow::Result<!> {
-    setup_global_config();
-    let mut args = env::args().skip(1);
-    let bind_address = args
-        .next()
-        .expect("Missing Bind Address")
-        .parse::<Ipv4Addr>()
-        .expect("Invalid Bind Address");
-    BIND_ADDRESS.set(bind_address).unwrap();
-    let bind_port = args
-        .next()
-        .expect("Missing Bind Port")
-        .parse::<u16>()
-        .expect("Invalid Bind Port");
-    BIND_PORT.set(bind_port).unwrap();
-    let id = args
-        .next()
-        .unwrap_or("10000".to_string())
-        .parse::<HashType>()
-        .expect("Invalid ID");
-
-    ID.set(id).unwrap();
+    config::setup_global_config();
+    let config = get_config();
     let cache = RedirectCache::new(10);
     let cache = Arc::new(RwLock::new(cache));
-    let udp_socket = UdpSocket::bind((bind_address, bind_port))?;
+    let udp_socket = UdpSocket::bind((config.bind_ip, config.bind_port))?;
 
     // Spawn thread with handles to socket and cache
     spawn_udp_listener(
-        bind_address,
-        bind_port,
-        id,
+        config.bind_ip,
+        config.bind_port,
+        config.bind_id,
         udp_socket.try_clone()?,
         cache.clone(),
     );
@@ -207,7 +178,7 @@ fn main() -> anyhow::Result<!> {
                 let recv_message = UDPMessage::from(buf);
                 match recv_message.message_type {
                     Lookup => {
-                        let (buf, target) = match where_is_hash(recv_message.hash) {
+                        let (buf, target) = match config.where_is_hash(recv_message.hash) {
                             Here => (
                                 UDPMessage::reply_from_this_node().as_bytes(),
                                 recv_message.as_location(),
@@ -216,7 +187,7 @@ fn main() -> anyhow::Result<!> {
                                 UDPMessage::reply_from_succ_node().as_bytes(),
                                 recv_message.as_location(),
                             ),
-                            Unknown => (buf, get_succ()),
+                            Unknown => (buf, config.get_succ()),
                         };
                         udp_socket.send_to(&buf, target)?;
                     }
@@ -240,9 +211,10 @@ fn spawn_udp_listener(
     cache: Arc<RwLock<RedirectCache>>,
 ) {
     let _: JoinHandle<anyhow::Result<!>> = thread::spawn(move || {
+        let config = get_config();
         let listener = TcpListener::bind((bind_address, bind_port))?;
         #[allow(clippy::unwrap_used)]
-        let table = HashTable::new(id, *PRED_ID.get().unwrap());
+        let table = HashTable::new(id, config.pred_id);
         let table = Arc::new(RwLock::new(table));
         for stream in listener.incoming().map(Result::unwrap) {
             let t_table = table.clone();
@@ -253,39 +225,6 @@ fn spawn_udp_listener(
 
         unreachable!()
     });
-}
-
-fn setup_global_config() {
-    let pred_id = env::var("PRED_ID")
-        .unwrap_or("0".to_string())
-        .parse::<HashType>()
-        .expect("Invalid Predecessor ID");
-    PRED_ID.set(pred_id).unwrap();
-    let pred_ip = env::var("PRED_IP")
-        .unwrap_or("127.0.0.1".to_string())
-        .parse::<Ipv4Addr>()
-        .expect("Invalid Predecessor IP");
-    PRED_IP.set(pred_ip).unwrap();
-    let pred_port = env::var("PRED_PORT")
-        .unwrap_or("5001".to_string())
-        .parse::<u16>()
-        .expect("Invalid Predecessor Port");
-    PRED_PORT.set(pred_port).unwrap();
-    let succ_id = env::var("SUCC_ID")
-        .unwrap_or("20000".to_string())
-        .parse::<HashType>()
-        .expect("Invalid Successor ID");
-    SUCC_ID.set(succ_id).unwrap();
-    let succ_ip = env::var("SUCC_IP")
-        .unwrap_or("127.0.0.1".to_string())
-        .parse::<Ipv4Addr>()
-        .expect("Invalid Successor IP");
-    SUCC_IP.set(succ_ip).unwrap();
-    let succ_port = env::var("SUCC_PORT")
-        .unwrap_or("5003".to_string())
-        .parse::<u16>()
-        .expect("Invalid Successor Port");
-    SUCC_PORT.set(succ_port).unwrap();
 }
 
 struct HttpHeader {
@@ -338,7 +277,8 @@ fn handle_connection(
         let header = read_header(&mut reader)?;
 
         let hash_value = BigEndian::read_u16(&Sha256::digest(&header.path));
-        match where_is_hash(hash_value) {
+        let config = get_config();
+        match config.where_is_hash(hash_value) {
             // This Node is responsible
             Here => match header.method.as_str() {
                 "GET" => {
@@ -359,7 +299,7 @@ fn handle_connection(
                 _ => panic!("invalid HTTP Method"),
             },
             Successor => {
-                writer.write_all(see_other(get_succ(), &header.path).as_bytes())?;
+                writer.write_all(see_other(config.get_succ(), &header.path).as_bytes())?;
             }
             Unknown => {
                 if let Some(location) = t_cache
@@ -373,7 +313,7 @@ fn handle_connection(
                         message_type: Lookup,
                         hash: hash_value,
                         #[allow(clippy::unwrap_used)]
-                        node_id: *ID.get().unwrap(),
+                        node_id: config.bind_id,
                         node_ip: match local_addr.ip() {
                             IpAddr::V4(addr) => addr,
                             IpAddr::V6(_) => panic!("IPv6 not supported"),
@@ -382,7 +322,7 @@ fn handle_connection(
                     };
                     let buf = message.as_bytes();
                     #[allow(clippy::unwrap_used)]
-                    socket.send_to(&buf, (*SUCC_IP.get().unwrap(), *SUCC_PORT.get().unwrap()))?;
+                    socket.send_to(&buf, (config.succ_ip, config.succ_port))?;
 
                     writer.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\n\r\n")?;
                 }
@@ -408,10 +348,6 @@ fn handle_delete(
     writer.write_all(header)?;
 
     Ok(())
-}
-
-fn get_succ() -> SocketAddrV4 {
-    SocketAddrV4::new(*SUCC_IP.get().unwrap(), *SUCC_PORT.get().unwrap())
 }
 
 fn see_other(location: SocketAddrV4, path: &str) -> String {
@@ -468,32 +404,4 @@ fn handle_get(
     }
 
     Ok(())
-}
-
-enum Location {
-    Here,
-    Successor,
-    Unknown,
-}
-
-fn where_is_hash(hash_value: HashType) -> Location {
-    if is_in_self(hash_value) {
-        Here
-    } else if is_in_successor(hash_value) {
-        Successor
-    } else {
-        Unknown
-    }
-}
-
-fn is_in_self(hash_value: HashType) -> bool {
-    *PRED_ID.get().unwrap() < hash_value && hash_value <= *ID.get().unwrap()
-        || *ID.get().unwrap() < *PRED_ID.get().unwrap() && hash_value <= *ID.get().unwrap()
-        || *ID.get().unwrap() < *PRED_ID.get().unwrap() && *PRED_ID.get().unwrap() < hash_value
-}
-
-fn is_in_successor(hash_value: HashType) -> bool {
-    *ID.get().unwrap() < hash_value && hash_value <= *SUCC_ID.get().unwrap()
-        || *SUCC_ID.get().unwrap() < *ID.get().unwrap() && hash_value <= *SUCC_ID.get().unwrap()
-        || *SUCC_ID.get().unwrap() < *ID.get().unwrap() && *ID.get().unwrap() < hash_value
 }
